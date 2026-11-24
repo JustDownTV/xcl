@@ -48,4 +48,25 @@ fn main() {
         add(&mut h, &[0]);
     }
     println!("cargo:rustc-env=XCL_TRANSLATOR_SOURCE_ID={h:016x}");
+
+    // xcl.exe's process heap is a segment heap: the driver's shader compiler allocates from it
+    // on every thread, and on the NT heap its threads queued on the heap lock – 0.4 of a core
+    // busy for 8 pipeline compiles, 11 cores with the segment heap. Only the heap type: the
+    // common controls stay in the menu's own activation context (`main.rs`).
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        let manifest = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("xcl.manifest");
+        std::fs::write(&manifest, SEGMENT_HEAP_MANIFEST).expect("write the manifest");
+        println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
+        println!("cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}", manifest.display());
+    }
 }
+
+const SEGMENT_HEAP_MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <heapType xmlns="http://schemas.microsoft.com/SMI/2020/WindowsSettings">SegmentHeap</heapType>
+    </windowsSettings>
+  </application>
+</assembly>
+"#;
