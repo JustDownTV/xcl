@@ -733,6 +733,7 @@ mod draw_wait_tests {
                 let _ = go_rx.recv();
                 real
             }),
+            0,
         );
         let (limit, budget) = (Some(Duration::from_millis(300)), FrameBudget::new());
         let lost = standin_draws();
@@ -766,8 +767,8 @@ mod draw_wait_tests {
         let (c, c_real, g, g_real) = (0x7410_0041usize, 0x7410_0042usize, 0x7410_0043usize, 0x7410_0044usize);
         let (c_tx, c_rx) = mpsc::channel::<()>();
         let (g_tx, g_rx) = mpsc::channel::<()>();
-        submit_lazy(c, true, Box::new(move || { let _ = c_rx.recv(); c_real }));
-        submit_lazy(g, false, Box::new(move || { let _ = g_rx.recv(); g_real }));
+        submit_lazy(c, true, Box::new(move || { let _ = c_rx.recv(); c_real }), 0);
+        submit_lazy(g, false, Box::new(move || { let _ = g_rx.recv(); g_real }), 0);
         let (limit, budget) = (Some(Duration::from_millis(200)), FrameBudget::new());
         assert_eq!(resolve_compute_within(c, limit, &budget), c, "the compute build is not done");
         let t = Instant::now();
@@ -787,7 +788,7 @@ mod draw_wait_tests {
         submit_lazy(g, false, Box::new(move || {
             std::thread::sleep(Duration::from_millis(100));
             g_real
-        }));
+        }), 0);
         assert_eq!(resolve_draw_with(g, None, &FrameBudget::new()), g_real);
         assert_eq!(resolve_draw_with(0x7410_0031, Some(Duration::ZERO), &FrameBudget::new()), 0x7410_0031, "not a stand-in");
         let _ = released(g);
@@ -815,6 +816,7 @@ mod tests {
                 let _ = rx.recv_timeout(Duration::from_secs(5));
                 real_pso
             }),
+            0,
         );
 
         // First call sends the lazy build to the compute worker pool and returns the stand-in after ~limit.
@@ -853,6 +855,7 @@ mod tests {
                 let _ = name_tx.send(std::thread::current().name().unwrap_or("").to_string());
                 real_pso
             }),
+            0,
         );
         assert_eq!(resolve_compute_within(standin, Some(Duration::from_secs(4)), &budget), real_pso);
         let worker_name = name_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -879,6 +882,7 @@ mod tests {
                 let _ = rx_a.recv_timeout(Duration::from_secs(5));
                 real_a
             }),
+            0,
         );
         submit_lazy(
             standin_b,
@@ -887,6 +891,7 @@ mod tests {
                 let _ = rx_b.recv_timeout(Duration::from_secs(5));
                 real_b
             }),
+            0,
         );
 
         // First slow pipeline consumes the entire 60 ms frame budget.
