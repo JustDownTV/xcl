@@ -177,12 +177,30 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
     });
     if send {
         let _ = enqueue(&p);
-    } else if used::known(key) {
+    } else if built_ahead(used::known(key), compute, eager_compute()) {
         if let Some(q) = preload() {
             q.list.lock().unwrap().push_back(p);
             q.cv.notify_one();
         }
     }
+}
+
+/// `XCL_EAGER_COMPUTE=0`: a compute pipeline no earlier run used is built only at its first
+/// use (as before). Otherwise it goes to the workers that build ahead when the title makes it.
+/// A compute pipeline is waited for at its first use (a skipped dispatch leaves output the title
+/// reads), and an NVIDIA driver takes 6 - 38 s for a big one: as a retail game's first
+/// cinematic began it bound twelve new ones one after another, each built on its own thread
+/// in turn, and stood still for more than three minutes.
+fn eager_compute() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    // (tests decide which thread builds what: off there)
+    *ON.get_or_init(|| !cfg!(test) && std::env::var("XCL_EAGER_COMPUTE").map_or(true, |v| v.trim() != "0"))
+}
+
+/// A lazy pipeline goes to the workers that build ahead when an earlier run used it, or when it
+/// is a compute one and those are built eagerly.
+fn built_ahead(known: bool, compute: bool, eager: bool) -> bool {
+    known || (compute && eager)
 }
 
 /// The pipelines a title used, by a hash of their shaders, kept between runs
@@ -280,7 +298,8 @@ fn preload() -> Option<&'static Preload> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
+        // (more of them while compute pipelines are built ahead too: driver builds of seconds)
+        let n = if eager_compute() { (crate::gpu::recomp::dxc::compile_threads() / 2).clamp(2, 6) } else { (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4) };
         for k in 0..n {
             let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
                 unsafe {
@@ -323,28 +342,14 @@ fn preload() -> Option<&'static Preload> {
 mod used_tests {
     use super::*;
 
-    /// A bind waits for a pipeline still being built no longer than its budget and goes on with
-    /// the stand-in; later binds do not wait for it again; once built it is the real one.
+    /// Built ahead: what an earlier run used, and every compute pipeline when that is on;
+    /// a graphics pipeline no run used waits for its first use.
     #[test]
-    fn a_bind_waits_for_a_slow_pipeline_no_longer_than_its_budget() {
-        let standin = 0x7E57_B001usize;
-        submit(standin, true, Box::new(|| {
-            std::thread::sleep(std::time::Duration::from_millis(600));
-            0x5151
-        }));
-        let budget = Some(std::time::Duration::from_millis(30));
-        let t = std::time::Instant::now();
-        assert_eq!(resolve_wait_for(standin, budget), standin, "not built within the budget: the stand-in");
-        assert!(t.elapsed() < std::time::Duration::from_millis(400), "waited {:?}", t.elapsed());
-        let t = std::time::Instant::now();
-        assert_eq!(resolve_wait_for(standin, budget), standin);
-        assert!(t.elapsed() < std::time::Duration::from_millis(20), "a late pipeline is not waited for again ({:?})", t.elapsed());
-        let start = std::time::Instant::now();
-        while is_pending(standin) && start.elapsed() < std::time::Duration::from_secs(10) {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert_eq!(resolve_wait_for(standin, budget), 0x5151, "built by a worker");
-        let _ = released(standin);
+    fn compute_pipelines_are_built_ahead_when_eager() {
+        assert!(built_ahead(true, false, false) && built_ahead(true, true, false));
+        assert!(built_ahead(false, true, true));
+        assert!(!built_ahead(false, true, false), "XCL_EAGER_COMPUTE=0");
+        assert!(!built_ahead(false, false, true), "a graphics one waits for its first use");
     }
 
     #[test]
