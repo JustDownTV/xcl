@@ -493,7 +493,11 @@ pub fn init() -> Result<String, String> {
                 &CLSID_D3D12DeviceRemovedExtendedData,
             ) {
                 Ok(d) => {
-                    d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    // `XCL_DRED=pf`: the page fault only – the breadcrumbs made a retail game's
+                    // driver refuse a compute pipeline for want of memory 8 s in
+                    if std::env::var("XCL_DRED").map_or(true, |v| v.trim() != "pf") {
+                        d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    }
                     d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
                 }
                 Err(e) => {
