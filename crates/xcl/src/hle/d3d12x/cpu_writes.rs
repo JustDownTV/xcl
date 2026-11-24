@@ -35,6 +35,36 @@ struct Job {
     fence: ID3D12Fence,
     value: u64,
     writes: Vec<Write>,
+    /// the queue and when the job was made (`XCL_TRACE_MEMORY_WAITS`)
+    queue: usize,
+    made: std::time::Instant,
+}
+
+/// `XCL_TRACE_MEMORY_WAITS=1`: who writes the memory a queue waits for, and when – each CPU
+/// write after the GPU (queued, landed), each memory wait, each queue Signal / Wait of the
+/// title's (the first 20 000 lines).
+pub(super) fn tracing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_TRACE_MEMORY_WAITS").is_some_and(|v| v != "0"))
+}
+
+/// One `XCL_TRACE_MEMORY_WAITS` line.
+pub(super) fn trace(args: std::fmt::Arguments) {
+    static N: AtomicU32 = AtomicU32::new(0);
+    if tracing() && N.fetch_add(1, Ordering::Relaxed) < 20_000 {
+        crate::xlog_info!("memtrace: {args}");
+    }
+}
+
+fn describe(writes: &[Write]) -> String {
+    writes
+        .iter()
+        .map(|w| match w {
+            Write::Immediate(va, words) => format!("{va:#x}={:#x}", words.iter().rev().fold(0u64, |v, &w| (v << 32) | w as u64)),
+            Write::ReadbackU64 { va, .. } => format!("{va:#x}=timestamp"),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // SAFETY: the fence is a free-threaded COM object; the writes are plain data
@@ -62,8 +92,9 @@ fn spawn_queue_worker() -> mpsc::Sender<Job> {
     let spawned = std::thread::Builder::new().name(format!("xcl-cpu-writes-{id}")).spawn(move || unsafe {
         let event = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
         for job in rx {
+            let mut timed_out = false;
             if job.fence.GetCompletedValue() < job.value && job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void)).is_ok() {
-                th::WaitForSingleObject(event, WAIT_MS);
+                timed_out = th::WaitForSingleObject(event, WAIT_MS) != 0;
                 if job.fence.GetCompletedValue() < job.value {
                     static LATE: AtomicU64 = AtomicU64::new(0);
                     let k = LATE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -71,6 +102,16 @@ fn spawn_queue_worker() -> mpsc::Sender<Job> {
                         crate::xlog_warn!("D3D12.X: {k} writes after the GPU so far done although their queue had not got there after {WAIT_MS} ms (fence at {}, wanted {}; {} writes)", job.fence.GetCompletedValue(), job.value, job.writes.len());
                     }
                 }
+            }
+            if tracing() {
+                trace(format_args!(
+                    "queue {:#x} submission {} done after {} ms{}: writing {}",
+                    job.queue,
+                    job.value,
+                    job.made.elapsed().as_millis(),
+                    if timed_out { " (TIMED OUT – written anyway)" } else { "" },
+                    describe(&job.writes)
+                ));
             }
             for w in &job.writes {
                 match w {
@@ -166,8 +207,11 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
         if q.Signal(&entry.fence, entry.value).is_err() {
             return;
         }
-        (entry.tx.clone(), Job { fence: entry.fence.clone(), value: entry.value, writes })
+        (entry.tx.clone(), Job { fence: entry.fence.clone(), value: entry.value, writes, queue: queue as usize, made: std::time::Instant::now() })
     };
+    if tracing() {
+        trace(format_args!("queue {:#x} submission {}: CPU writes after it {}", queue as usize, job.value, describe(&job.writes)));
+    }
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({} in the first submission)", job.writes.len()));
     let _ = tx.send(job);

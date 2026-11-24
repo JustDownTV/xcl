@@ -5012,6 +5012,11 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
                     super::list_x::note_title_queue_wait(this as usize, a1, a2 as u64);
                 }
             }
+            if super::cpu_writes::tracing() {
+                let fr = a1 as *mut c_void;
+                let completed = ID3D12Fence::from_raw_borrowed(&fr).map_or(0, |f| f.GetCompletedValue());
+                super::cpu_writes::trace(format_args!("queue {:#x} {} fence {a1:#x} value {a2:#x} (completed {completed:#x})", this as usize, if older == 14 { "Signal" } else { "Wait" }));
+            }
             hr as u32 as usize
         }
         16 => {
@@ -5101,6 +5106,7 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
         super::fence_x::note_queue_signal(fence as usize, value);
         super::list_x::note_title_queue_signal(this as usize, fence as usize, value);
     }
+    super::cpu_writes::trace(format_args!("queue {:#x} SignalX fence {:#x} value {value:#x}", this as usize, fence as usize));
     hr
 }
 
@@ -5133,6 +5139,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         }
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
+    super::cpu_writes::trace(format_args!("queue {:#x} executes {} lists", this as usize, mapped.len()));
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
         super::alloc_pool::executed(this, chunk);
