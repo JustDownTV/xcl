@@ -793,6 +793,12 @@ impl Pipelines {
         if FIRST.lock().unwrap().as_ref().is_some_and(|f| !f.contains(&crate::hle::d3d12x::real::driver_cache::name(&c.dxil, 0))) {
             return;
         }
+        // `XCL_PRECOMPILE_MAX_KB`: only programs of up to that much DXIL (the driver takes
+        // minutes for some of the 1 - 2 MB ones: the many smaller ones first)
+        static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        if c.dxil.len() > *MAX.get_or_init(|| std::env::var("XCL_PRECOMPILE_MAX_KB").ok().and_then(|v| v.parse::<usize>().ok()).map_or(usize::MAX, |k| k << 10)) {
+            return;
+        }
         let disk = crate::hle::d3d12x::real::driver_cache::path(&c.dxil, 0);
         if disk.as_deref().is_some_and(|p| p.exists()) {
             self.made.fetch_add(1, Ordering::Relaxed);
