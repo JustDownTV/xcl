@@ -741,6 +741,8 @@ struct Pipelines {
     dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
     signatures: Mutex<std::collections::HashMap<Vec<u32>, windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
     made: AtomicUsize,
+    /// of `made`: their driver blob was already in the run's disk cache (not built again)
+    on_disk: AtomicUsize,
     refused: AtomicUsize,
     /// driver compiles running and the most at once (`XCL_PIPELINE_THREADS`, 4): each of the
     /// biggest takes ~1.5 GB in the driver – fifteen at once took 24 GB
@@ -761,7 +763,7 @@ impl Pipelines {
             let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
             let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
             let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
-            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most })
+            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), on_disk: AtomicUsize::new(0), refused: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most })
         }
     }
 
@@ -785,6 +787,15 @@ impl Pipelines {
                 },
             }
         };
+        // the file a title's run reads the driver's blob from (`driver_cache`): there already,
+        // nothing to build; made here, the blob goes there too – the driver's own shader cache
+        // is not certain to hold it (a retail run still built 32 of them at their first use)
+        let disk = crate::hle::d3d12x::real::driver_cache::path(&c.dxil, 0);
+        if disk.as_deref().is_some_and(|p| p.exists()) {
+            self.made.fetch_add(1, Ordering::Relaxed);
+            self.on_disk.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
             CS: D3D12_SHADER_BYTECODE { pShaderBytecode: c.dxil.as_ptr() as *const _, BytecodeLength: c.dxil.len() },
@@ -802,11 +813,22 @@ impl Pipelines {
         self.running.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
         let done = match r {
-            Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
+            Ok(pso) => {
+                if let (Some(p), Ok(blob)) = (disk.as_deref(), unsafe { pso.GetCachedBlob() }) {
+                    let bytes = unsafe { std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()) };
+                    crate::hle::d3d12x::real::driver_cache::write(p, bytes);
+                }
+                self.made.fetch_add(1, Ordering::Relaxed) + 1
+            }
             Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
         };
         if done % 25 == 0 {
-            eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
+            eprintln!(
+                "  pipelines: {} made ({} already on disk), {} refused",
+                self.made.load(Ordering::Relaxed),
+                self.on_disk.load(Ordering::Relaxed),
+                self.refused.load(Ordering::Relaxed)
+            );
         }
     }
 }
