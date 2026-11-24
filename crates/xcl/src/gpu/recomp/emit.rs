@@ -4249,7 +4249,7 @@ impl Em {
             for k in 1..windows {
                 let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem{k} : register(u{});", 2 + k);
             }
-            h.push_str("static uint xcl_w = 0u;\nstatic uint xcl_uma_base = 0u;\n");
+            h.push_str("static uint xcl_w = 0u;\nstatic uint xcl_uma_base = 0u;\nstatic uint xcl_wbase = 0u;\n");
             h.push_str(MEM_ACCESSORS_HERE);
         } else {
             h.push_str(LOADX4_ONE_WINDOW);
@@ -4284,6 +4284,9 @@ impl Em {
         let load_sgprs = |h: &mut String| {
             if windows > 1 {
                 let _ = writeln!(h, "    xcl_w = 0u;\n    xcl_uma_base = io.Load({}u);", super::IO_UMA_BASE_HI * 4);
+                if super::heap_windows() {
+                    let _ = writeln!(h, "    xcl_wbase = io.Load({}u);", super::IO_WINDOW_VIEWS * 4);
+                }
             }
             for &c in &sg {
                 let _ = writeln!(h, "    uint {} = io.Load({}u);", sname(c).unwrap(), c * 4);
@@ -4703,7 +4706,7 @@ impl Em {
             }
         }
         if windows > 1 {
-            h = windowed(&h, windows);
+            h = windowed(&h, windows, matches!(self.opt.mode, Mode::Compute(_)));
         }
         h
     }
@@ -5090,9 +5093,9 @@ const MEM_ACCESSORS_HERE: &str = "//XCL_MEM_ACCESSORS\n";
 const LOADX4_ONE_WINDOW: &str = "uint4 xcl_loadx4(uint4 a) { return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); }\n";
 
 /// Several memory windows: every `mem.Method(` of the program (and of the preludes) becomes
-/// an accessor `xcl_mMethod(` that switches on `xcl_w` between `mem` and `mem1`.., whose
-/// definitions replace the placeholder.
-fn windowed(h: &str, windows: u32) -> String {
+/// an accessor `xcl_mMethod(` – over heap views of the windows (`heap_windows`) or a switch on
+/// `xcl_w` between `mem` and `mem1`.. – whose definitions replace the placeholder.
+fn windowed(h: &str, windows: u32, coherent: bool) -> String {
     let mut out = String::with_capacity(h.len() + 8192);
     let mut rest = h;
     while let Some(i) = rest.find("mem.") {
@@ -5110,14 +5113,15 @@ fn windowed(h: &str, windows: u32) -> String {
         }
     }
     out.push_str(rest);
-    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows), 1)
+    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, coherent), 1)
 }
 
 /// The accessor functions: one per `mem` method (and overload) the translator emits.
 /// Only explicit windows `0..windows` touch GPU buffers; any out-of-range `xcl_w` hits
 /// `default` (reads return 0, stores/atomics are dropped and zero their `out` parameter) so
-/// out-of-UMA pointers can never wrap onto live memory windows.
-fn mem_accessors(windows: u32) -> String {
+/// out-of-UMA pointers can never wrap onto live memory windows. `coherent`: the views are
+/// `globallycoherent`, as `mem` is for compute.
+fn mem_accessors(windows: u32, coherent: bool) -> String {
     let mut sigs: Vec<(&str, String, &str, &str, &str)> = vec![
         ("uint", "Load".into(), "uint a", "a", "return 0u;"),
         ("uint2", "Load2".into(), "uint a", "a", "return uint2(0u, 0u);"),
@@ -5140,6 +5144,28 @@ fn mem_accessors(windows: u32) -> String {
             sigs.push(("void", format!("Interlocked{op}"), "uint a, int v, out int o", "a, v, o", "o = 0; break;"));
             sigs.push(("void", format!("Interlocked{op}64"), "uint a, int64_t v, out int64_t o", "a, v, o", "o = (int64_t)0; break;"));
         }
+    }
+    if super::heap_windows() {
+        // view w * WINDOW_VIEWS + (a >> WINDOW_VIEW_SHIFT) of the bound heap, at a's offset in it
+        let (views, shift, mask) = (super::WINDOW_VIEWS, super::WINDOW_VIEW_SHIFT, (1u32 << super::WINDOW_VIEW_SHIFT) - 1);
+        let coh = if coherent { "globallycoherent " } else { "" };
+        let view = |b: &str, a: &str| format!("{coh}RWByteAddressBuffer {b} = ResourceDescriptorHeap[NonUniformResourceIndex(xcl_wbase + xcl_w * {views}u + (({a}) >> {shift}u))];");
+        let mut s = String::new();
+        let _ = writeln!(
+            s,
+            "uint4 xcl_loadx4(uint4 a) {{ if (xcl_w >= {windows}u) return uint4(0u, 0u, 0u, 0u); {} {} {} {} return uint4(b0.Load(a.x & 0x{mask:X}u), b1.Load(a.y & 0x{mask:X}u), b2.Load(a.z & 0x{mask:X}u), b3.Load(a.w & 0x{mask:X}u)); }}",
+            view("b0", "a.x"),
+            view("b1", "a.y"),
+            view("b2", "a.z"),
+            view("b3", "a.w")
+        );
+        for (ret, name, params, args, def) in sigs {
+            let def = def.replace("break;", "return;");
+            let args = args.replacen('a', &format!("(a & 0x{mask:X}u)"), 1);
+            let call = if ret == "void" { format!("b.{name}({args});") } else { format!("return b.{name}({args});") };
+            let _ = writeln!(s, "{ret} xcl_m{name}({params}) {{ if (xcl_w >= {windows}u) {{ {def} }} {} {call} }}", view("b", "a"));
+        }
+        return s;
     }
     let mut s = String::new();
     let _ = write!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] switch (xcl_w) {{ ");

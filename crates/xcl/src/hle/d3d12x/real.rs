@@ -197,6 +197,12 @@ pub fn uma_gpu_va() -> u64 {
     uma_window_vas().first().copied().unwrap_or(0)
 }
 
+/// The UMA window buffers (raw `ID3D12Resource` pointers, 0: none), for the heap views of
+/// translated programs (`console_heap::write_window_views`).
+pub(crate) fn uma_window_buffers() -> Vec<usize> {
+    UMA_BUFFER.lock().map(|g| g.iter().map(|b| b.0).collect()).unwrap_or_default()
+}
+
 /// GPU virtual addresses of the UMA window buffers (`u2`, `u3`.. of the shader ABI).
 pub fn uma_window_vas() -> Vec<u64> {
     UMA_BUFFER.lock().map(|g| g.iter().map(|b| b.1).collect()).unwrap_or_default()
@@ -364,6 +370,8 @@ unsafe fn open_uma(device: &ID3D12Device) {
     );
     *UMA_HEAPS.lock().unwrap() = heaps;
     *UMA_BUFFER.lock().unwrap() = bufs;
+    // the shared view heap may exist already: its window views now
+    super::console_heap::write_window_views();
 }
 
 pub fn stats() -> D3d12Stats {

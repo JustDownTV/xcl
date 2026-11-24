@@ -176,6 +176,27 @@ pub const GS_PRIMS_PER_GROUP: u32 = 21;
 pub const IO_GS_PRIMS: usize = 110;
 pub const IO_GS_VERTICES: usize = 111;
 pub const IO_UMA_BASE_HI: usize = 112;
+/// io slot: the index in the bound CBV/SRV/UAV heap of the first window view (`heap_windows`):
+/// 0 in the runtime's shared heap, past the test textures in the runner's.
+pub const IO_WINDOW_VIEWS: usize = 113;
+
+/// With several memory windows, a translated program reaches them through raw buffer views in
+/// the bound CBV/SRV/UAV heap: view `w * WINDOW_VIEWS + (offset >> WINDOW_VIEW_SHIFT)` of window
+/// `w` covers 512 MiB from `(offset >> WINDOW_VIEW_SHIFT) << WINDOW_VIEW_SHIFT` (a view holds
+/// at most 2^27 dwords; overlapping by half, no 16-byte access straddles two). One access per
+/// site instead of a switch over the window root UAVs: a retail game's 1.1 MB compute program
+/// took the NVIDIA driver 88.7 s with the switch, 13 s with the views (`XCL_MEM_WINDOW_SWITCH=1`:
+/// the switch, as before).
+pub const WINDOW_VIEWS: u32 = 16;
+pub const WINDOW_VIEW_SHIFT: u32 = 28;
+/// bytes a window view covers
+pub const WINDOW_VIEW_BYTES: u64 = 1 << 29;
+
+/// Whether translated programs reach several memory windows through heap views (above).
+pub fn heap_windows() -> bool {
+    static H: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *H.get_or_init(|| !std::env::var("XCL_MEM_WINDOW_SWITCH").is_ok_and(|v| v.trim() == "1"))
+}
 
 impl GsInterface {
     /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)

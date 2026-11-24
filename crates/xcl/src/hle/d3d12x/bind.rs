@@ -895,6 +895,9 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let rs = rs as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
     let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first)));
+    if windows.len() > 1 && crate::gpu::recomp::heap_windows() {
+        super::list_x::ensure_view_heap(this, list);
+    }
     if gfx {
         list.SetGraphicsRootSignature(rs);
         for (k, v) in views.enumerate() {

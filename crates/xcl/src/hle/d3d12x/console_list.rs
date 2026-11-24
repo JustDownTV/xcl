@@ -694,6 +694,8 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     let mut layout: Option<Arc<Layout>> = None;
     let mut table: Vec<u8> = Vec::new();
     let mut pso: Option<*const ConsolePso> = None;
+    // the shared view heap (the window views of translated programs) bound on the list
+    let mut view_heap = false;
     let chunks: Vec<Vec<u32>> = st.chunks.iter().map(|(c, used)| c[..*used].chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect()).collect();
     'chunks: for words in &chunks {
         let mut at = 0usize;
@@ -718,6 +720,8 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         crate::xlog_info!("frame trace: SetDescriptorHeaps {:x?}", (0..n).map(|k| get(2 + 2 * k) as usize | (get(3 + 2 * k) as usize) << 32).collect::<Vec<_>>());
                     }
                 }
+                let global = super::console_heap::global_heap();
+                view_heap = global.is_some() && heaps.iter().flatten().any(|h| Some(h) == global.as_ref());
                 list.SetDescriptorHeaps(&heaps);
                 at += 2 + 2 * n;
             } else if w0 == TRANSITIONS_MARKER {
@@ -824,6 +828,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
                         let io_at = uma_copy(st, bytemuck_u32(&io)).ok_or("UMA: io")?;
                         let res_at = uma_copy(st, &[0u8; 256]).ok_or("UMA: res")?;
+                        if !view_heap && windows.len() > 1 && crate::gpu::recomp::heap_windows() {
+                            view_heap = super::console_heap::bind_global(&list, None);
+                        }
                         // the pipeline's own root signature when it has static samplers
                         let own = super::real::pso_root_signature(real).or(((*p).rs != 0).then_some((*p).rs)).map(|r| r as *mut c_void);
                         match own.as_ref().and_then(|r| ID3D12RootSignature::from_raw_borrowed(r)) {

@@ -157,10 +157,39 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             inc: dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
             heap,
             cap,
-            next: 0,
+            // the first descriptors: the window views of translated programs
+            next: crate::gpu::recomp::pso::WINDOW_HEAP_DESCRIPTORS,
             free: Vec::new(),
         });
+        if let Some(s) = g.as_ref() {
+            write_views(s);
+        }
     }
+    true
+}
+
+/// The window views at the start of the shared heap (`gpu::recomp::heap_windows`), over the
+/// UMA window buffers open now (null views for the others).
+pub fn write_window_views() {
+    if let Some(s) = GLOBAL.lock().unwrap().as_ref() {
+        write_views(s);
+    }
+}
+
+fn write_views(s: &Global) {
+    use windows::core::Interface as _;
+    let bufs = super::real::uma_window_buffers();
+    let res: Vec<Option<ID3D12Resource>> = bufs.iter().map(|&b| (b != 0).then(|| unsafe { ID3D12Resource::from_raw_borrowed(&(b as *mut std::ffi::c_void)).cloned() }).flatten()).collect();
+    let refs: Vec<Option<&ID3D12Resource>> = res.iter().map(|r| r.as_ref()).collect();
+    unsafe { crate::gpu::recomp::pso::write_window_views(&s.dev, s.cpu as usize, s.inc, &refs) };
+}
+
+/// Binds the shared view heap on `list` (with `sampler`, the sampler heap the list had) for a
+/// translated program, which reaches the memory windows through it. False: there is none.
+pub unsafe fn bind_global(list: &ID3D12GraphicsCommandList, sampler: Option<ID3D12DescriptorHeap>) -> bool {
+    let Some(g) = global_heap() else { return false };
+    let heaps: Vec<Option<ID3D12DescriptorHeap>> = sampler.into_iter().map(Some).chain([Some(g)]).collect();
+    list.SetDescriptorHeaps(&heaps);
     true
 }
 

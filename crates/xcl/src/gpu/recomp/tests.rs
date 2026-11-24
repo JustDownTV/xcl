@@ -3215,6 +3215,11 @@ fn gpu_memory_windows_above_4_gib() {
     assert!(!one.hlsl.contains("mem1") && !one.hlsl.contains("xcl_w =") && !one.hlsl.contains("xcl_m"), "one window: the single-window HLSL");
     let t = translate(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
     assert!(t.hlsl.contains("RWByteAddressBuffer mem1 : register(u3)"));
+    if super::heap_windows() {
+        // one access per site through a heap view of the window, no switch over mem, mem1
+        assert!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(xcl_wbase + xcl_w * 16u + ((a) >> 28u))]"), "{}", t.hlsl);
+        assert!(!t.hlsl.contains("switch (xcl_w)") && t.hlsl.contains("xcl_wbase = io.Load(452u);"), "{}", t.hlsl);
+    }
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
     let hi = |a: u64| (a >> 32) as u32;
     let mut st = KernelState::default();
@@ -3451,6 +3456,8 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
         let dev_raw = crate::hle::d3d12x::real::device_raw();
         let dev = ID3D12Device::from_raw_borrowed(&dev_raw).expect("device").clone();
         let rs = crate::gpu::recomp::pso::abi_root_signature(&dev, false).expect("ABI root signature");
+        crate::hle::d3d12x::console_heap::shared_heap(&dev);
+        crate::hle::d3d12x::console_heap::write_window_views();
         let pso: ID3D12PipelineState = dev
             .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
@@ -3477,6 +3484,8 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
                 alloc.Reset().unwrap();
                 list.Reset(&alloc, Some(&pso)).unwrap();
             }
+            // the window views in the shared heap, as a translated dispatch binds them
+            assert!(crate::hle::d3d12x::console_heap::bind_global(&list, None) || !crate::gpu::recomp::heap_windows(), "the shared view heap");
             list.SetComputeRootSignature(&rs);
             list.SetComputeRootUnorderedAccessView(0, crate::hle::d3d12x::real::uma_va_of(io_buf).unwrap());
             list.SetComputeRootUnorderedAccessView(1, crate::hle::d3d12x::real::uma_va_of(res_buf).unwrap());

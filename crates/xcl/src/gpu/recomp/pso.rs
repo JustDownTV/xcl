@@ -157,7 +157,9 @@ mod translated {
             if std::env::var("XCL_TRANSLATED_CACHE").is_ok_and(|v| v == "0") {
                 return 0;
             }
-            identity_for(env!("XCL_TRANSLATOR_SOURCE_ID"), super::dxc::toolchain_identity())
+            // (the window accessors differ by `heap_windows`)
+            let source = if crate::gpu::recomp::heap_windows() { env!("XCL_TRANSLATOR_SOURCE_ID").to_string() } else { format!("{}-switch", env!("XCL_TRANSLATOR_SOURCE_ID")) };
+            identity_for(&source, super::dxc::toolchain_identity())
         })
     }
 
@@ -649,6 +651,45 @@ pub fn static_sampler_desc(k: u32, (w, comparison): &StaticSampler) -> D3D12_STA
         ShaderRegister: k,
         RegisterSpace: 1,
         ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    }
+}
+
+/// Descriptors the window views take at the start of the bound CBV/SRV/UAV heap (`heap_windows`):
+/// `WINDOW_VIEWS` for each of the 4 windows a program may address.
+pub const WINDOW_HEAP_DESCRIPTORS: u32 = 4 * super::WINDOW_VIEWS;
+
+/// Writes the window views translated programs reach memory through (`heap_windows`) at the
+/// heap position `cpu` (`inc` bytes a descriptor): view `k * WINDOW_VIEWS + j` is the raw view
+/// of `windows[k]` from `j << WINDOW_VIEW_SHIFT`, `WINDOW_VIEW_BYTES` long or up to the buffer's
+/// end; past it, or for a window without a buffer, a null view.
+pub unsafe fn write_window_views(dev: &ID3D12Device, cpu: usize, inc: u32, windows: &[Option<&ID3D12Resource>]) {
+    let raw = |first: u64, n: u32| D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Buffer: D3D12_BUFFER_UAV { FirstElement: first, NumElements: n, StructureByteStride: 0, CounterOffsetInBytes: 0, Flags: D3D12_BUFFER_UAV_FLAG_RAW } },
+    };
+    for k in 0..4usize {
+        let buf = windows.get(k).copied().flatten();
+        let size = buf.map_or(0, |b| b.GetDesc().Width);
+        for j in 0..super::WINDOW_VIEWS as u64 {
+            let handle = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu + (k * super::WINDOW_VIEWS as usize + j as usize) * inc as usize };
+            let start = j << super::WINDOW_VIEW_SHIFT;
+            // a view ends 256 bytes below 4 GiB of its buffer at most: an NVIDIA driver took a
+            // raw view ending 16 bytes below it as an invalid call that removes the device (64
+            // bytes below it was taken) – the last 256 bytes of a full window are out of reach
+            let end = (start + super::WINDOW_VIEW_BYTES).min(size).min((1 << 32) - 256);
+            let bytes = end.saturating_sub(start) & !255;
+            match buf {
+                Some(b) if bytes > 0 => dev.CreateUnorderedAccessView(b, None, Some(&raw(start / 4, (bytes / 4) as u32)), handle),
+                // a null view (typed): reads give 0, writes are dropped
+                _ => {
+                    let mut null = raw(0, 1);
+                    null.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
+                    null.Anonymous.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+                    dev.CreateUnorderedAccessView(None, None, Some(&null), handle)
+                }
+            }
+        }
     }
 }
 

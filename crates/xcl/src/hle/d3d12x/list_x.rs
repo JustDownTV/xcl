@@ -3251,6 +3251,29 @@ pub(super) unsafe fn pc_heaps(n: u32, heaps: *const usize) -> Vec<Option<ID3D12D
     out
 }
 
+/// Before a translated program on `list` (`pc`, its PC list): the shared view heap bound, which
+/// holds the window views it reaches memory through (`gpu::recomp::heap_windows`) – a list that
+/// bound no view heap (a compute list without textures) would leave its heap accesses undefined.
+/// The sampler heap the title bound stays.
+pub(super) unsafe fn ensure_view_heap(list: *mut c_void, pc: &ID3D12GraphicsCommandList) {
+    let Some(g) = super::console_heap::global_heap() else { return };
+    let graw = g.as_raw() as usize;
+    let mut set = None;
+    with_bindings(list, |b| {
+        if !b.heaps.contains(&graw) {
+            let sampler = b.heaps.iter().copied().find(|&h| {
+                h != 0 && ID3D12DescriptorHeap::from_raw_borrowed(&(h as *mut c_void)).is_some_and(|d| d.GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+            });
+            b.heaps = sampler.into_iter().chain([graw]).collect();
+            set = Some(b.heaps.clone());
+        }
+    });
+    if let Some(v) = set {
+        let heaps: Vec<Option<ID3D12DescriptorHeap>> = v.iter().map(|&h| ID3D12DescriptorHeap::from_raw_borrowed(&(h as *mut c_void)).cloned()).collect();
+        pc.SetDescriptorHeaps(&heaps);
+    }
+}
+
 /// console #32 SetDescriptorHeaps (PC #28)
 pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n: u32, heaps: *const usize) {
     const PC_SET_DESCRIPTOR_HEAPS: usize = 28;

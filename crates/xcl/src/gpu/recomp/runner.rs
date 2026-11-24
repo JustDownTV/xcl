@@ -163,14 +163,28 @@ struct Bound {
     _upload: Option<ID3D12Resource>,
 }
 
+/// Where the window views go in a runner heap (`IO_WINDOW_VIEWS`): past the test textures'
+/// descriptors (an SRV and a UAV each).
+fn window_view_base(textures: usize) -> u32 {
+    (2 * textures).max(2) as u32
+}
+
+/// The window views (`heap_windows`) at `base` in `heap`: window k over `windows[k]`, the
+/// first buffer for windows past them (as the root UAVs u2..u5 are bound).
+unsafe fn write_views_at(dev: &ID3D12Device, heap: &ID3D12DescriptorHeap, base: u32, windows: &[&ID3D12Resource]) {
+    let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    let refs: Vec<Option<&ID3D12Resource>> = (0..4).map(|k| windows.get(k).or(windows.first()).copied()).collect();
+    super::pso::write_window_views(dev, heap.GetCPUDescriptorHandleForHeapStart().ptr + (base * inc) as usize, inc, &refs);
+}
+
 /// Create the descriptor heaps (always, so the directly indexed root signature is valid),
 /// the test textures and samplers; record the uploads into `list`.
-unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textures: &[TestTexture], samplers: &[TestSampler]) -> Result<Bound, String> {
-    let n = (2 * textures.len()).max(2) as u32;
+unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textures: &[TestTexture], samplers: &[TestSampler], windows: &[&ID3D12Resource]) -> Result<Bound, String> {
+    let n = window_view_base(textures.len());
     let heap: ID3D12DescriptorHeap = dev
         .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            NumDescriptors: n,
+            NumDescriptors: n + super::pso::WINDOW_HEAP_DESCRIPTORS,
             Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
             NodeMask: 0,
         })
@@ -307,6 +321,7 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
         dev.GetCopyableFootprints(rd, 0, subs, 0, Some(rfps.as_mut_ptr()), None, None, Some(&mut readable));
         out.push((r, rfps, readable));
     }
+    write_views_at(dev, &heap, n, windows);
     list.SetDescriptorHeaps(&[Some(heap.clone()), Some(sheap.clone())]);
     Ok(Bound { _heaps: [heap, sheap], textures: out, _upload: upload })
 }
@@ -466,6 +481,7 @@ pub fn run_with_statics(
     let mut io: Vec<u32> = state.sgpr.clone();
     io.resize(KERNEL_SGPRS, 0);
     io[KERNEL_SCC_SLOT] = state.scc;
+    io[super::IO_WINDOW_VIEWS] = window_view_base(textures.len());
     for lane in 0..KERNEL_LANES {
         let mut regs = state.vgpr.get(lane).cloned().unwrap_or_default();
         regs.resize(KERNEL_VGPRS, 0);
@@ -506,7 +522,7 @@ pub fn run_with_statics(
             transition(&mem_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
-        let bound = bind_resources(dev, &list, textures, samplers)?;
+        let bound = bind_resources(dev, &list, textures, samplers, &[&mem_buf])?;
         list.SetComputeRootSignature(&rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
@@ -781,11 +797,11 @@ pub struct Draw {
 }
 
 /// Heaps with `textures` (SRV at 2·i) and `samplers` (at j), bound on `list`.
-unsafe fn bind_views(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textures: &[ViewTexture], samplers: &[D3D12_SAMPLER_DESC]) -> Result<Vec<windows::core::IUnknown>, String> {
+unsafe fn bind_views(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textures: &[ViewTexture], samplers: &[D3D12_SAMPLER_DESC], windows: &[&ID3D12Resource]) -> Result<Vec<windows::core::IUnknown>, String> {
     let heap: ID3D12DescriptorHeap = dev
         .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            NumDescriptors: (2 * textures.len()).max(2) as u32,
+            NumDescriptors: window_view_base(textures.len()) + super::pso::WINDOW_HEAP_DESCRIPTORS,
             Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
             NodeMask: 0,
         })
@@ -839,6 +855,7 @@ unsafe fn bind_views(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textu
         keep.push(r.cast().map_err(e)?);
         keep.push(up.cast().map_err(e)?);
     }
+    write_views_at(dev, &heap, window_view_base(textures.len()), windows);
     list.SetDescriptorHeaps(&[Some(heap), Some(sheap)]);
     Ok(keep)
 }
@@ -920,6 +937,7 @@ fn draw_indexed_on(
         for d in draws {
             let mut r = d.sgprs.clone();
             r.resize(KERNEL_SGPRS, 0);
+            r[super::IO_WINDOW_VIEWS] = window_view_base(textures.len());
             io.extend_from_slice(&r);
         }
         let io_bytes = (io.len() * 4) as u64;
@@ -956,7 +974,7 @@ fn draw_indexed_on(
         list.ClearRenderTargetView(rtv, &clear, None);
         list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: size as f32, Height: size as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
         list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: size as i32, bottom: size as i32 }]);
-        let _bound = if textures.is_empty() && samplers.is_empty() { bind_resources(dev, &list, &[], &[]).map(|_| Vec::new())? } else { bind_views(dev, &list, textures, samplers)? };
+        let _bound = if textures.is_empty() && samplers.is_empty() { bind_resources(dev, &list, &[], &[], &[&mem_buf]).map(|_| Vec::new())? } else { bind_views(dev, &list, textures, samplers, &[&mem_buf])? };
         list.SetGraphicsRootSignature(rs);
         list.SetGraphicsRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetGraphicsRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
@@ -1143,6 +1161,7 @@ pub fn mesh_draw_split(
 
         let mut io = sgprs.to_vec();
         io.resize(KERNEL_SGPRS, 0);
+        io[super::IO_WINDOW_VIEWS] = window_view_base(0);
         let io_bytes = (io.len() * 4) as u64;
         let mem_len = mem.len().max(64);
         let mem_bytes = (mem_len * 4) as u64;
@@ -1174,7 +1193,7 @@ pub fn mesh_draw_split(
             transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
         // pass 1: the console program as a compute shader
-        let _bound = bind_resources(dev, &list, &[], &[])?;
+        let _bound = bind_resources(dev, &list, &[], &[], &[&mem_buf])?;
         list.SetComputeRootSignature(&gpu.rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
@@ -1230,6 +1249,25 @@ unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
 
 
+/// The window views a program with several windows reaches memory through (`heap_windows`):
+/// window k over `bufs[k]` (the first buffer for windows past them, as the root UAVs u2..u5
+/// are bound), in a heap bound on `list` – to call before its root signature; the heap is
+/// returned to be kept until the list has run.
+unsafe fn bind_window_views(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, bufs: &[&ID3D12Resource]) -> Result<ID3D12DescriptorHeap, String> {
+    let views: ID3D12DescriptorHeap = dev
+        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: super::pso::WINDOW_HEAP_DESCRIPTORS,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        })
+        .map_err(e)?;
+    let refs: Vec<Option<&ID3D12Resource>> = (0..4).map(|k| bufs.get(k).or(bufs.first()).copied()).collect();
+    super::pso::write_window_views(dev, views.GetCPUDescriptorHandleForHeapStart().ptr, dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV), &refs);
+    list.SetDescriptorHeaps(&[Some(views.clone())]);
+    Ok(views)
+}
+
 /// `run` with a unified memory region as `mem` (u2): the GPU works on the process memory
 /// itself, no copies.
 pub fn run_in_arena(dxil: &[u8], state: &KernelState, arena: &crate::gpu::uma::Uma) -> Result<KernelResult, String> {
@@ -1245,6 +1283,7 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
     let mut io: Vec<u32> = state.sgpr.clone();
     io.resize(KERNEL_SGPRS, 0);
     io[KERNEL_SCC_SLOT] = state.scc;
+    io[super::IO_WINDOW_VIEWS] = 0; // the views are at the start of `bind_window_views` heap
     if let Some(&(base, _)) = arena.windows.first() {
         io[super::IO_UMA_BASE_HI] = ((base as usize) >> 32) as u32;
     }
@@ -1303,6 +1342,7 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         for b in &bufs[1..] {
             list.ResourceBarrier(&[transition(b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
         }
+        let _views = bind_window_views(dev, &list, &bufs.iter().collect::<Vec<_>>())?;
         list.SetComputeRootSignature(&gpu.rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
@@ -1404,6 +1444,7 @@ fn dispatch_with(
 ) -> Result<(Vec<u32>, Vec<f64>), String> {
     let mut io = sgprs.to_vec();
     io.resize(KERNEL_SGPRS, 0);
+    io[super::IO_WINDOW_VIEWS] = window_view_base(0);
     let mem_len = mem.len().max(64);
     unsafe {
         let (io_bytes, mem_bytes) = ((io.len() * 4) as u64, (mem_len * 4) as u64);
@@ -1428,7 +1469,7 @@ fn dispatch_with(
             transition(&mem_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
-        let _bound = bind_resources(dev, &list, &[], &[])?;
+        let _bound = bind_resources(dev, &list, &[], &[], &[&mem_buf])?;
         list.SetComputeRootSignature(rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
