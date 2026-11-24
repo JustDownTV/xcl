@@ -79,6 +79,13 @@ pub fn host_main(boot_path: &Path) -> i32 {
             }
         });
     }
+    // `XCL_MEMORY_MAP=s`: every s seconds, where the process's committed address space is
+    if let Some(every) = std::env::var("XCL_MEMORY_MAP").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&s| s > 0) {
+        let _ = std::thread::Builder::new().name("xcl-memory-map".into()).spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(every));
+            log_memory_map();
+        });
+    }
     // `XCL_THREAD_DUMP_AT=s1,s2…`: where every thread is at those seconds (a stalled title)
     if let Ok(v) = std::env::var("XCL_THREAD_DUMP_AT") {
         let at: Vec<f64> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
@@ -147,4 +154,67 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::report::write_final(None);
     crate::log::flush();
     code as i32
+}
+
+/// `XCL_MEMORY_MAP`: the committed address space by kind (private / mapped / image), private
+/// allocations by size, and the allocations holding the most. Video memory WDDM charges to the
+/// process is not in the address space: the `memory:` line's total minus these is that part.
+fn log_memory_map() {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_IMAGE, MEM_MAPPED};
+    let mut by_base: std::collections::HashMap<usize, (u64, u64, u32)> = std::collections::HashMap::new();
+    let (mut private, mut mapped, mut image) = (0u64, 0u64, 0u64);
+    let mut addr = 0usize;
+    loop {
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(addr as *const _, &mut m, std::mem::size_of_val(&m)) } == 0 {
+            break;
+        }
+        let size = m.RegionSize as u64;
+        if m.State == MEM_COMMIT {
+            match m.Type {
+                MEM_IMAGE => image += size,
+                MEM_MAPPED => mapped += size,
+                _ => private += size,
+            }
+            let e = by_base.entry(m.AllocationBase as usize).or_insert((0, 0, m.Type));
+            e.0 += size;
+        }
+        if let Some(e) = by_base.get_mut(&(m.AllocationBase as usize)) {
+            e.1 = e.1.max((m.BaseAddress as usize + m.RegionSize - m.AllocationBase as usize) as u64);
+        }
+        match (m.BaseAddress as usize).checked_add(m.RegionSize) {
+            Some(next) if next > addr => addr = next,
+            _ => break,
+        }
+    }
+    let mb = |b: u64| b >> 20;
+    // private allocations by how much each holds: under 1 MB, 1 - 64 MB, 64 MB and more
+    let mut classes = [(0u64, 0u64); 3];
+    for &(c, _, ty) in by_base.values() {
+        if ty != MEM_IMAGE && ty != MEM_MAPPED && c > 0 {
+            let k = if c < 1 << 20 { 0 } else if c < 64 << 20 { 1 } else { 2 };
+            classes[k].0 += 1;
+            classes[k].1 += c;
+        }
+    }
+    crate::xlog_info!(
+        "memory map: {} MB private, {} MB mapped, {} MB image committed; private allocations: {} under 1 MB ({} MB), {} of 1-64 MB ({} MB), {} of 64 MB+ ({} MB)",
+        mb(private),
+        mb(mapped),
+        mb(image),
+        classes[0].0,
+        mb(classes[0].1),
+        classes[1].0,
+        mb(classes[1].1),
+        classes[2].0,
+        mb(classes[2].1)
+    );
+    let mut top: Vec<(usize, (u64, u64, u32))> = by_base.into_iter().filter(|(_, (c, _, _))| *c > 0).collect();
+    top.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    let line: Vec<String> = top
+        .iter()
+        .take(12)
+        .map(|(base, (c, span, ty))| format!("{base:#x} {} of {} MB{}", mb(*c), mb(*span), match *ty { MEM_MAPPED => " mapped", MEM_IMAGE => " image", _ => "" }))
+        .collect();
+    crate::xlog_info!("memory map: largest committed allocations: {}", line.join(", "));
 }
