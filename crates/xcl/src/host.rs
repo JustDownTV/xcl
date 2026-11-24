@@ -162,6 +162,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
 fn log_memory_map() {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_IMAGE, MEM_MAPPED};
     let mut by_base: std::collections::HashMap<usize, (u64, u64, u32)> = std::collections::HashMap::new();
+    // committed private bytes by page protection (write-combined: memory the GPU shares)
+    let mut by_protect: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
     let (mut private, mut mapped, mut image) = (0u64, 0u64, 0u64);
     let mut addr = 0usize;
     loop {
@@ -174,7 +176,10 @@ fn log_memory_map() {
             match m.Type {
                 MEM_IMAGE => image += size,
                 MEM_MAPPED => mapped += size,
-                _ => private += size,
+                _ => {
+                    private += size;
+                    *by_protect.entry(m.Protect).or_default() += size;
+                }
             }
             let e = by_base.entry(m.AllocationBase as usize).or_insert((0, 0, m.Type));
             e.0 += size;
@@ -208,6 +213,22 @@ fn log_memory_map() {
         mb(classes[1].1),
         classes[2].0,
         mb(classes[2].1)
+    );
+    // the 1 - 64 MB private allocations by committed size (MB, rounded up): which sizes repeat
+    let mut sizes: std::collections::BTreeMap<u64, (u64, u64)> = std::collections::BTreeMap::new();
+    for &(c, span, ty) in by_base.values() {
+        if ty != MEM_IMAGE && ty != MEM_MAPPED && (1 << 20..64 << 20).contains(&c) {
+            let e = sizes.entry(c.div_ceil(1 << 20)).or_default();
+            e.0 += 1;
+            e.1 += span;
+        }
+    }
+    let mut sizes: Vec<(u64, (u64, u64))> = sizes.into_iter().collect();
+    sizes.sort_by(|a, b| (b.1 .0 * b.0).cmp(&(a.1 .0 * a.0)));
+    crate::xlog_info!(
+        "memory map: private by protection: {}; 1-64 MB allocations by size: {}",
+        by_protect.iter().map(|(p, b)| format!("{p:#x} {} MB", mb(*b))).collect::<Vec<_>>().join(", "),
+        sizes.iter().take(10).map(|(m, (n, span))| format!("{n}x {m} MB (reserved {} MB each)", mb(span / n))).collect::<Vec<_>>().join(", ")
     );
     let mut top: Vec<(usize, (u64, u64, u32))> = by_base.into_iter().filter(|(_, (c, _, _))| *c > 0).collect();
     top.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
