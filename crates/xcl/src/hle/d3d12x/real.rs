@@ -3463,6 +3463,24 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
             return Some(Err(()));
         }
     }
+    // `XCL_SKIP_COMPUTE_KB=lo-hi`: programs of lo to hi KB of DXIL (hi excluded) are not built,
+    // blob on disk or not – halving the range finds a program a run's GPU hangs on
+    static SKIP_KB: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    if let Some((lo, hi)) = *SKIP_KB.get_or_init(|| {
+        let v = std::env::var("XCL_SKIP_COMPUTE_KB").ok()?;
+        let (a, b) = v.split_once('-')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    }) {
+        let kb = dxil.len() >> 10;
+        if (lo..hi).contains(&kb) {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_warn!("D3D12.X: {n} compute programs of {lo}-{hi} KB of DXIL not built so far (XCL_SKIP_COMPUTE_KB), this one {kb} KB");
+            }
+            return Some(Err(()));
+        }
+    }
     let Some(rs) = abi_rs_for(this, &compiled.samplers) else { return Some(Err(())) };
     LAST_COMPUTE_RS.with(|c| c.set(rs as usize));
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
