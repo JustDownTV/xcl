@@ -882,6 +882,9 @@ fn precompile_pass(input: &Input, limit: usize, windows: u32, split: Option<bool
         let (k, m) = (k.trim().parse::<usize>().ok()?, m.trim().parse::<usize>().ok()?);
         (m > 0 && k < m).then_some((k, m))
     });
+    // `XCL_PRECOMPILE_REVERSE=1`: from the last shader to the first – processes started later
+    // take the end of the pack and meet the others' work only where both arrive
+    let reverse = std::env::var("XCL_PRECOMPILE_REVERSE").is_ok_and(|v| v.trim() == "1");
     let next = AtomicUsize::new(0);
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -906,6 +909,7 @@ fn precompile_pass(input: &Input, limit: usize, windows: u32, split: Option<bool
                 if i >= n {
                     break;
                 }
+                let i = if reverse { n - 1 - i } else { i };
                 if shard.is_some_and(|(k, m)| i % m != k) {
                     continue;
                 }
