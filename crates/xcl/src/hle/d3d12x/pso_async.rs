@@ -31,8 +31,6 @@ struct Pending {
     timed_out: std::sync::atomic::AtomicBool,
     /// the stand-in was released before the real pipeline was built
     orphan: std::sync::atomic::AtomicBool,
-    /// a bind waited for it longer than `wait_budget`: binds go on without it until it is built
-    late: std::sync::atomic::AtomicBool,
 }
 
 impl Pending {
@@ -168,7 +166,6 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         used: Default::default(),
         timed_out: Default::default(),
         orphan: Default::default(),
-        late: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -404,11 +401,6 @@ pub fn resolve(pso: usize) -> usize {
 /// `resolve`, waiting for a pipeline still being built – built here if no worker has started
 /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
 pub fn resolve_wait(pso: usize) -> usize {
-    resolve_wait_for(pso, wait_budget())
-}
-
-/// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
-fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
     let start = Instant::now();
