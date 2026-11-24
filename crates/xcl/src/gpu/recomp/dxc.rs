@@ -372,18 +372,64 @@ struct Job {
     reply: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
 }
 
-/// Compile threads (DXC workers, and the PSO workers of `pso_async` that feed them): every core
-/// but one, `XCL_DXC_THREADS` to choose. Memory is what `wait_for_memory` watches: a retail
-/// pack's biggest translations take ~0.7 GB in DXC (a typical one 0.1–0.3 GB). The cap used
-/// to be 6, which left most of a 16-thread CPU idle while a title with ~24 000 shaders
-/// compiled for half an hour. (Normal priority: a title thread can wait for a pipeline –
-/// `resolve_wait`, a compute pipeline's first bind – and must not wait behind its own threads.)
+/// DXC workers and the PSO workers that feed them: leave a CPU thread free and budget
+/// 1 GiB per worker from available physical memory / commit after the title's reserve.
+/// This startup cap complements the live commit gate; `XCL_DXC_THREADS` overrides it.
 pub fn compile_threads() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-        std::env::var("XCL_DXC_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(cores.saturating_sub(1)).clamp(1, 64)
+        let requested = std::env::var("XCL_DXC_THREADS").ok().and_then(|v| v.parse().ok());
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        let available = (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some((m.ullAvailPhys, m.ullAvailPageFile));
+        compile_thread_limit(cores, requested, available, RESERVE_GB.load(std::sync::atomic::Ordering::Relaxed))
     })
+}
+
+fn compile_thread_limit(cores: usize, requested: Option<usize>, available: Option<(u64, u64)>, reserve_gb: u64) -> usize {
+    if let Some(n) = requested {
+        return n.clamp(1, 64);
+    }
+    // A big translation can grow to ~0.7 GiB in DXC. Do not treat pagefile-backed commit
+    // as free RAM; without a memory reading, start one worker instead of guessing.
+    let memory_limit = available.map_or(1, |(physical, commit)| {
+        (physical.min(commit).saturating_sub(reserve_gb.saturating_mul(1 << 30)) >> 30).clamp(1, 64) as usize
+    });
+    cores.saturating_sub(1).clamp(1, 64).min(memory_limit)
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::compile_thread_limit;
+
+    #[test]
+    fn default_workers_fit_physical_memory_and_commit() {
+        for (physical, commit, want) in [(20, 40, 14), (12, 40, 6), (8, 40, 2), (40, 8, 2), (6, 40, 1), (0, 0, 1)] {
+            assert_eq!(compile_thread_limit(32, None, Some((physical << 30, commit << 30)), 6), want);
+        }
+        // Less than a full GiB of headroom must not admit another worker.
+        assert_eq!(compile_thread_limit(32, None, Some(((8 << 30) - 1, 40 << 30)), 6), 1);
+        assert_eq!(compile_thread_limit(32, None, Some((20 << 30, 40 << 30)), 2), 18);
+    }
+
+    #[test]
+    fn default_workers_leave_a_cpu_free_and_handle_missing_memory() {
+        let plenty = Some((128 << 30, 128 << 30));
+        assert_eq!(compile_thread_limit(16, None, plenty, 6), 15);
+        assert_eq!(compile_thread_limit(1, None, plenty, 6), 1);
+        assert_eq!(compile_thread_limit(128, None, plenty, 6), 64);
+        assert_eq!(compile_thread_limit(32, None, None, 6), 1);
+    }
+
+    #[test]
+    fn explicit_workers_keep_the_existing_override_and_bounds() {
+        for (requested, want) in [(0, 1), (4, 4), (64, 64), (128, 64)] {
+            assert_eq!(compile_thread_limit(1, Some(requested), Some((0, 0)), 6), want);
+            assert_eq!(compile_thread_limit(1, Some(requested), None, 6), want);
+        }
+    }
 }
 
 /// GB of commit `wait_for_memory` keeps free besides the compiles: 6 for a running title (its

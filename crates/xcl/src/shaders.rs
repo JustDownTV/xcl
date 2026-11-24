@@ -828,10 +828,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let next = AtomicUsize::new(0);
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    // Set the offline reserve before the worker count takes its memory snapshot.
+    recomp::dxc::set_memory_reserve(2);
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = recomp::dxc::compile_threads() + 2;
-    // no title runs: only a little commit is kept free besides the compiles
-    recomp::dxc::set_memory_reserve(2);
     // VS / PS: the 32-lane form wherever the GPU can run 32-lane waves (`pso::graphics_wave32`);
     // `--split` sets both
     let graphics_split = split.unwrap_or_else(recomp::runner::graphics_wave32);
