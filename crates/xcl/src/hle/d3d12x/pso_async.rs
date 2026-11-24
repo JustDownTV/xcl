@@ -103,10 +103,16 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
 }
 
 /// Dedicated worker pool for compute pipelines so a backlog (or driver stall, #156) of graphics
-/// builds cannot starve compute dispatches indefinitely.
+/// builds cannot starve compute dispatches indefinitely. At least two workers: with the compile
+/// thread count bounded by free memory (2 when ~8 GB of commit is free), one worker would let a
+/// single driver build of tens of seconds hold every other compute pipeline behind it.
 fn compute_queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
     static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
-    Q.get_or_init(|| spawn_pool("xcl-pso-compute", (crate::gpu::recomp::dxc::compile_threads() / 2).clamp(1, 4)))
+    Q.get_or_init(|| spawn_pool("xcl-pso-compute", compute_workers(crate::gpu::recomp::dxc::compile_threads())))
+}
+
+fn compute_workers(compile_threads: usize) -> usize {
+    (compile_threads / 2).clamp(2, 4)
 }
 
 /// Send `p` to its worker pool if not already sent; clears `sent` on failure so a later bind
@@ -860,5 +866,12 @@ mod tests {
         }
         assert_eq!(released(standin_a), real_a);
         assert_eq!(released(standin_b), real_b);
+    }
+
+    /// One slow compute build must not hold every other one: two workers even when free
+    /// memory allows only one or two compile threads.
+    #[test]
+    fn compute_pool_keeps_two_workers_when_memory_is_short() {
+        assert_eq!([1, 2, 3, 4, 5, 8, 9, 31].map(compute_workers), [2, 2, 2, 2, 2, 4, 4, 4]);
     }
 }
