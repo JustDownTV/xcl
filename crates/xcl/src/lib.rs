@@ -20,6 +20,7 @@ pub mod inspect;
 pub mod launcher;
 pub mod loader;
 pub mod modules;
+pub mod title_patches;
 pub mod pe;
 pub mod preflight;
 pub mod report;

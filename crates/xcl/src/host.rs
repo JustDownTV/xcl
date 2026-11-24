@@ -152,6 +152,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
         }
     };
     unsafe { crate::hle::kernelx::adopt_title_hooks(&main) };
+    unsafe { crate::title_patches::apply(&main) };
     crate::report::write_final(None);
     let code = crate::loader::run_main(&main);
     crate::xlog_info!("game entry point returned code {code}");
