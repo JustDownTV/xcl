@@ -494,11 +494,15 @@ pub fn init() -> Result<String, String> {
             ) {
                 Ok(d) => {
                     // `XCL_DRED=pf`: the page fault only – the breadcrumbs made a retail game's
-                    // driver refuse a compute pipeline for want of memory 8 s in
-                    if std::env::var("XCL_DRED").map_or(true, |v| v.trim() != "pf") {
+                    // driver refuse a compute pipeline for want of memory 8 s in; `bc`: the
+                    // breadcrumbs only
+                    let mode = std::env::var("XCL_DRED").unwrap_or_default();
+                    if mode.trim() != "pf" {
                         d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
                     }
-                    d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    if mode.trim() != "bc" {
+                        d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    }
                 }
                 Err(e) => {
                     crate::xlog_warn!("D3D12: DRED requested but unavailable: {e}");
