@@ -1,24 +1,23 @@
 //! Compatibility patches for known title binaries, made in memory after the title is mapped and
-//! only where its bytes are exactly the expected ones: any other build is left as it is.
+//! only where its bytes are exactly the expected ones: any other build is left as it is. The
+//! game file on disk is never changed.
 //!
-//! The retail game's stall watchdog (`game_scarlett_master.exe` 1.0.2.1, the function at
-//! +0x2215a60, decoded in #232) ends the process with a write to address 0 when one of its
-//! watched threads has not posted for longer than a constant 300.0. On the console nothing
-//! holds a thread that long; on a PC an NVIDIA driver takes up to 25 s for one big translated
-//! compute pipeline at its first use, and a skipped dispatch leaves output the title reads (it
-//! crashed on it). The watchdog's load of that limit (`vmovss xmm7, [rip + 300.0]`) is pointed
-//! at a float.MAX the image already holds, so the limit is never reached; the 300.0 itself,
-//! which other code may share, is not changed. `XCL_TITLE_WATCHDOG=1`: keep the watchdog.
+//! The retail game's stall watchdog (`game_scarlett_master.exe` 1.0.2.1, decoded in #232) is the
+//! entry function of a thread of its own (+0x2215a60; a generic thread start calls it through
+//! `call [rsi]` at +0x2215ec8). It ends the process – the report hook it calls writes to address
+//! 0 (+0x23cf683), then it writes there itself (+0x2215c35) – when a watched thread has not
+//! posted for too long. On the console nothing holds a thread that long; on a PC an NVIDIA
+//! driver takes 9 - 25 s for one big translated compute pipeline at its first use, and the
+//! title was ended there every run (skipping those dispatches instead left output it read and
+//! crashed on). Pointing the limit's load at float.MAX did not stop it, so the thread itself is
+//! parked: the entry jumps to `park`, which sleeps for good. `XCL_TITLE_WATCHDOG=1`: keep it.
 
 use crate::modules::MappedModule;
 
-/// `vmovss xmm7, dword [rip + disp32]` with the displacement the 1.0.2.1 build has
-const WATCHDOG_LOAD_RVA: usize = 0x2215ae2;
-const WATCHDOG_LOAD: [u8; 8] = [0xc5, 0xfa, 0x10, 0x3d, 0x36, 0x43, 0xf4, 0x03];
-/// where that load reads: 300.0f
-const WATCHDOG_LIMIT_RVA: usize = 0x6159e20;
-const LIMIT_300: [u8; 4] = 300.0f32.to_le_bytes();
-const FLOAT_MAX: [u8; 4] = f32::MAX.to_le_bytes();
+/// the watchdog thread's entry and its first 16 bytes in the 1.0.2.1 build
+/// (push r15 / r14 / r13 / r12 / rsi / rdi / rbp / rbx; sub rsp, 0x68)
+const WATCHDOG_ENTRY_RVA: usize = 0x2215a60;
+const WATCHDOG_ENTRY: [u8; 16] = [0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x56, 0x57, 0x55, 0x53, 0x48, 0x83, 0xec, 0x68];
 
 pub unsafe fn apply(main: &MappedModule) {
     if std::env::var("XCL_TITLE_WATCHDOG").is_ok_and(|v| v.trim() == "1") {
@@ -27,80 +26,73 @@ pub unsafe fn apply(main: &MappedModule) {
     if !main.name.eq_ignore_ascii_case("game_scarlett_master.exe") {
         return;
     }
-    match patch_watchdog(main.base, main.size) {
-        Ok(at) => crate::xlog_info!("title patch: the stall watchdog's limit (+{WATCHDOG_LOAD_RVA:#x}) now reads float.MAX at +{at:#x} – long first-use pipeline builds stall the title instead of ending it (XCL_TITLE_WATCHDOG=1: keep it)"),
+    match park_watchdog(main.base, main.size) {
+        Ok(()) => crate::xlog_info!("title patch: the stall watchdog thread (+{WATCHDOG_ENTRY_RVA:#x}) is parked – a long first-use pipeline build stalls the title instead of ending it (XCL_TITLE_WATCHDOG=1: keep it)"),
         Err(why) => crate::xlog_info!("title patch: stall watchdog left as it is ({why})"),
     }
 }
 
-/// The new rel32 for an instruction ending at `next` to reach `target`, if in range.
-fn rel32(next: usize, target: usize) -> Option<i32> {
-    i32::try_from(target as i64 - next as i64).ok()
+/// `mov rax, target; jmp rax`
+fn jump_to(target: usize) -> [u8; 12] {
+    let mut c = [0u8; 12];
+    c[0] = 0x48;
+    c[1] = 0xB8;
+    c[2..10].copy_from_slice(&(target as u64).to_le_bytes());
+    c[10] = 0xFF;
+    c[11] = 0xE0;
+    c
 }
 
-/// Whether `code` is the expected load and `limit` the 300.0 it reads.
-fn is_watchdog(code: &[u8], limit: &[u8]) -> bool {
-    code == WATCHDOG_LOAD && limit == LIMIT_300
+/// Where the watchdog thread goes instead: it sleeps for good (the process ends it).
+unsafe extern "system" fn park() -> ! {
+    crate::xlog_info!("title patch: the stall watchdog thread started and is parked");
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
 }
 
-unsafe fn readable(addr: usize, len: usize) -> bool {
-    crate::gpu::shader::readable(addr, len)
-}
-
-unsafe fn patch_watchdog(base: usize, size: usize) -> Result<usize, String> {
-    let load = base + WATCHDOG_LOAD_RVA;
-    let limit = base + WATCHDOG_LIMIT_RVA;
-    if WATCHDOG_LIMIT_RVA + 4 > size || !readable(load, 8) || !readable(limit, 4) {
+unsafe fn park_watchdog(base: usize, size: usize) -> Result<(), String> {
+    let entry = base + WATCHDOG_ENTRY_RVA;
+    if WATCHDOG_ENTRY_RVA + 16 > size || !crate::gpu::shader::readable(entry, 16) {
         return Err("not this build".into());
     }
-    let code = std::slice::from_raw_parts(load as *const u8, 8);
-    if !is_watchdog(code, std::slice::from_raw_parts(limit as *const u8, 4)) {
+    if std::slice::from_raw_parts(entry as *const u8, 16) != WATCHDOG_ENTRY {
         return Err("not this build".into());
     }
-    // a float.MAX in the image's read-only data (4-byte aligned), near the 300.0
-    let mut found = None;
-    let (lo, hi) = (WATCHDOG_LIMIT_RVA.saturating_sub(64 << 20) & !3, (WATCHDOG_LIMIT_RVA + (64 << 20)).min(size) & !3);
-    let mut rva = lo;
-    while rva + 4 <= hi {
-        let a = base + rva;
-        if (a & 0xFFF) == 0 && !readable(a, 0x1000.min(hi - rva)) {
-            rva += 0x1000;
-            continue;
-        }
-        if std::slice::from_raw_parts(a as *const u8, 4) == FLOAT_MAX {
-            found = Some(rva);
-            break;
-        }
-        rva += 4;
-    }
-    let target_rva = found.ok_or("no float.MAX in the image")?;
-    let disp = rel32(load + 8, base + target_rva).ok_or("float.MAX out of reach")?;
+    let code = jump_to(park as usize);
     use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
     let mut old = 0u32;
-    if VirtualProtect((load + 4) as *const _, 4, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+    if VirtualProtect(entry as *const _, code.len(), PAGE_EXECUTE_READWRITE, &mut old) == 0 {
         return Err("VirtualProtect failed".into());
     }
-    std::ptr::write_unaligned((load + 4) as *mut i32, disp);
+    std::ptr::copy_nonoverlapping(code.as_ptr(), entry as *mut u8, code.len());
     let mut tmp = 0u32;
-    VirtualProtect((load + 4) as *const _, 4, old, &mut tmp);
-    windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(windows_sys::Win32::System::Threading::GetCurrentProcess(), load as *const _, 8);
-    Ok(target_rva)
+    VirtualProtect(entry as *const _, code.len(), old, &mut tmp);
+    windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(windows_sys::Win32::System::Threading::GetCurrentProcess(), entry as *const _, code.len());
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Only the exact load of the exact 300.0 is the watchdog; a displacement reaches its target.
+    /// The jump is `mov rax, imm64; jmp rax` to the given address, 12 bytes (inside the 16 checked).
     #[test]
-    fn the_watchdog_is_recognised_only_by_its_exact_bytes() {
-        assert!(is_watchdog(&WATCHDOG_LOAD, &LIMIT_300));
-        let mut other = WATCHDOG_LOAD;
-        other[3] = 0x35; // xmm6: another load
-        assert!(!is_watchdog(&other, &LIMIT_300));
-        assert!(!is_watchdog(&WATCHDOG_LOAD, &200.0f32.to_le_bytes()));
-        // the 1.0.2.1 displacement: +0x2215aea + 0x03f44336 = +0x6159e20
-        assert_eq!(rel32(0x2215aea, 0x6159e20), Some(0x03f4_4336));
-        assert_eq!(rel32(0x1000, 0x1_0000_1000), None, "out of rel32 range");
+    fn the_entry_jump_reaches_its_target() {
+        let c = jump_to(0x1122_3344_5566_7788);
+        assert_eq!(c[..2], [0x48, 0xB8]);
+        assert_eq!(u64::from_le_bytes(c[2..10].try_into().unwrap()), 0x1122_3344_5566_7788);
+        assert_eq!(c[10..], [0xFF, 0xE0]);
+        assert!(c.len() <= WATCHDOG_ENTRY.len());
+    }
+
+    /// A function whose first bytes differ is left alone.
+    #[test]
+    fn another_build_is_left_alone() {
+        let mut image = vec![0u8; WATCHDOG_ENTRY_RVA + 16];
+        image[WATCHDOG_ENTRY_RVA..].copy_from_slice(&[0x90; 16]);
+        let r = unsafe { park_watchdog(image.as_ptr() as usize, image.len()) };
+        assert_eq!(r, Err("not this build".to_string()));
+        assert!(image[WATCHDOG_ENTRY_RVA..].iter().all(|&b| b == 0x90), "nothing written");
     }
 }
