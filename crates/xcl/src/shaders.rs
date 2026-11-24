@@ -847,6 +847,13 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     };
     let pipelines = pipelines.as_ref();
     let n = input.len().min(limit);
+    // `XCL_PRECOMPILE_SHARD=k/m`: only the shaders i with i % m == k – several processes share
+    // the pack, each with its own heap (the driver's compiler threads queue on one process heap)
+    let shard = std::env::var("XCL_PRECOMPILE_SHARD").ok().and_then(|v| {
+        let (k, m) = v.split_once('/')?;
+        let (k, m) = (k.trim().parse::<usize>().ok()?, m.trim().parse::<usize>().ok()?);
+        (m > 0 && k < m).then_some((k, m))
+    });
     let next = AtomicUsize::new(0);
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -870,6 +877,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= n {
                     break;
+                }
+                if shard.is_some_and(|(k, m)| i % m != k) {
+                    continue;
                 }
                 let (name, blob) = input.get(i);
                 let Some(blob) = blob else { continue };
