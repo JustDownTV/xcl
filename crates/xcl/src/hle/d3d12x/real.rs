@@ -3442,6 +3442,19 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     if big && crate::gpu::recomp::dxc::defer() {
         return Some(Err(()));
     }
+    // `XCL_SKIP_COMPUTE_DXIL_MB=N`: a program of more than N MB of DXIL whose driver blob is not
+    // on disk is not built – its dispatches are skipped. A retail game's two 30 MB programs took
+    // the driver more than 23 GB each and held the title's thread for longer than a run.
+    static SKIP_MB: OnceLock<Option<usize>> = OnceLock::new();
+    if let Some(mb) = *SKIP_MB.get_or_init(|| std::env::var("XCL_SKIP_COMPUTE_DXIL_MB").ok().and_then(|v| v.trim().parse().ok()).filter(|&m: &usize| m > 0)) {
+        if dxil.len() > mb << 20 && !driver_cache::path(&dxil, (*d).Flags.0).is_some_and(|p| p.exists()) {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 16 {
+                crate::xlog_warn!("D3D12.X: a compute program of {} MB of DXIL is not built (XCL_SKIP_COMPUTE_DXIL_MB={mb}): its dispatches are skipped", dxil.len() >> 20);
+            }
+            return Some(Err(()));
+        }
+    }
     let Some(rs) = abi_rs_for(this, &compiled.samplers) else { return Some(Err(())) };
     LAST_COMPUTE_RS.with(|c| c.set(rs as usize));
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
