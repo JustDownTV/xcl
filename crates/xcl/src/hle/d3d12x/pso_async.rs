@@ -528,14 +528,37 @@ pub fn waited_ms() -> u64 {
     WAITED_MS.load(Ordering::Relaxed)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// (tests) `XCL_COMPUTE_PSO_WAIT_MS` on this thread: Some(limit), None = the default
+    static COMPUTE_WAIT_FOR_TEST: std::cell::Cell<Option<Option<std::time::Duration>>> = const { std::cell::Cell::new(None) };
+}
+
+/// (tests) Compute waits on this thread as with `XCL_COMPUTE_PSO_WAIT_MS` (`None`: until built);
+/// `clear_compute_wait_for_test` goes back to the default.
+#[cfg(test)]
+pub(crate) fn set_compute_wait_for_test(limit: Option<std::time::Duration>) {
+    COMPUTE_WAIT_FOR_TEST.with(|c| c.set(Some(limit)));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_compute_wait_for_test() {
+    COMPUTE_WAIT_FOR_TEST.with(|c| c.set(None));
+}
+
 /// Maximum per-frame time title threads wait for uncached compute pipelines on first
-/// bind/dispatch (`XCL_COMPUTE_PSO_WAIT_MS`, default 4000 ms; `0` = unbounded). Huge compute
-/// shaders can take 20+ s to compile in DXC / the driver, and a loading frame can bind many
-/// uncached compute pipelines in a row; sharing one budget per frame keeps the total bounded.
+/// bind/dispatch (`XCL_COMPUTE_PSO_WAIT_MS`; default 0 = until built). A skipped dispatch leaves
+/// output the title reads: with a 4 s limit a retail game skipped ~1 660 dispatches as its first
+/// cinematic began and crashed on what they left (a different address each run); waiting for
+/// them, it ran on (its stall watchdog parked, `title_patches`).
 fn compute_wait_timeout() -> Option<std::time::Duration> {
+    #[cfg(test)]
+    if let Some(v) = COMPUTE_WAIT_FOR_TEST.with(|c| c.get()) {
+        return v;
+    }
     static LIMIT: OnceLock<Option<std::time::Duration>> = OnceLock::new();
     *LIMIT.get_or_init(|| {
-        let ms = std::env::var("XCL_COMPUTE_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4000);
+        let ms = std::env::var("XCL_COMPUTE_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
         if ms == 0 { None } else { Some(std::time::Duration::from_millis(ms)) }
     })
 }

@@ -1217,9 +1217,12 @@ mod tests {
 
         reset(list_ptr, 0x7200_0100, standin_pending);
         let before_pending = counts_snapshot();
+        // (the bounded mode, XCL_COMPUTE_PSO_WAIT_MS=4000: the default waits until built)
+        pso_async::set_compute_wait_for_test(Some(std::time::Duration::from_secs(4)));
         unsafe {
             execute_indirect(list_ptr, 0x7200_00F1, 1, 0, 0, 0, 0);
         }
+        pso_async::clear_compute_wait_for_test();
         let after_pending = counts_snapshot();
         assert!(after_pending[DISPATCHES_SKIPPED] > before_pending[DISPATCHES_SKIPPED]);
         assert_eq!(

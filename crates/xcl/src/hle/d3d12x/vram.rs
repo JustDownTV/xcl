@@ -174,11 +174,13 @@ const EVICT_MIN_TILES: u32 = 4;
 /// Page budget: tiles freed per eviction round once the pools are at the budget.
 const EVICT_BATCH: usize = 512;
 
-/// Page budget: pool heaps the pages may take, from `XCL_PAGE_BUDGET_MB` (0: no limit).
+/// Page budget: pool heaps the pages may take, from `XCL_PAGE_BUDGET_MB` (0: no limit; default
+/// 6144 outside tests – without it a retail game's world load took 15 of a 16 GB card and
+/// 4.6 GB more in system memory, and the machine paged until the title stalled).
 fn pool_cap() -> usize {
     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| {
-        let mb: usize = std::env::var("XCL_PAGE_BUDGET_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        let mb: usize = std::env::var("XCL_PAGE_BUDGET_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(if cfg!(test) { 0 } else { 6144 });
         if mb == 0 {
             return 0;
         }
