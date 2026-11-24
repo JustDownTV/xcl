@@ -1242,12 +1242,151 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
             _ => merged.push((a, n)),
         }
     }
-    s.rb_value += 1;
-    let v = s.rb_value;
-    if queue.Signal(&s.rb_fence, v).is_ok() {
-        let _ = s.queue.Wait(&s.rb_fence, v);
+    if !async_readbacks() {
+        s.rb_value += 1;
+        let v = s.rb_value;
+        if queue.Signal(&s.rb_fence, v).is_ok() {
+            let _ = s.queue.Wait(&s.rb_fence, v);
+        }
+        s.readback_ranges(&merged);
+        return;
     }
-    s.readback_ranges(&merged);
+    let dev = s.dev.clone();
+    drop(g);
+    // fences per title queue: the copy waits for that queue's work only
+    let (fence, done, v) = {
+        let mut f = RB_QUEUES.lock().unwrap();
+        let m = f.get_or_insert_with(std::collections::HashMap::new);
+        let key = queue.as_raw() as usize;
+        if !m.contains_key(&key) {
+            let (Ok(fence), Ok(done)) = (dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE), dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE)) else { return };
+            m.insert(key, RbQueue { fence, done, value: 0, waited: 0 });
+        }
+        let e = m.get_mut(&key).unwrap();
+        e.value += 1;
+        if queue.Signal(&e.fence, e.value).is_err() {
+            return;
+        }
+        (e.fence.clone(), e.done.clone(), e.value)
+    };
+    let mut p = READBACKS.lock().unwrap();
+    p.push(Readback { fence, done, value: v, ranges: merged, since: std::time::Instant::now() });
+    drop(p);
+    start_readback_worker();
+    READBACK_READY.notify_one();
+}
+
+/// `XCL_ASYNC_READBACK=0`: GPU writes into sparse windows are copied back in the submitting
+/// thread, the copy queue waiting for the title's queue (as before).
+fn async_readbacks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_ASYNC_READBACK").map_or(true, |v| v != "0"))
+}
+
+/// A copy-back of GPU-written sparse ranges, due once `fence` (its title queue's) is at `value`;
+/// `done` goes to `value` once it is made.
+struct Readback {
+    fence: ID3D12Fence,
+    done: ID3D12Fence,
+    value: u64,
+    ranges: Vec<(usize, usize)>,
+    since: std::time::Instant,
+}
+
+// SAFETY: the fences are free-threaded COM objects; the ranges are plain data
+unsafe impl Send for Readback {}
+
+/// A title queue's copy-backs: `fence` the queue signals after the lists, `done` the worker
+/// signals after the copy, the last value of both, and the last one the queue waited for.
+struct RbQueue {
+    fence: ID3D12Fence,
+    done: ID3D12Fence,
+    value: u64,
+    waited: u64,
+}
+
+// SAFETY: free-threaded COM objects and plain numbers
+unsafe impl Send for RbQueue {}
+
+/// title queue → its copy-back fences
+static RB_QUEUES: Mutex<Option<std::collections::HashMap<usize, RbQueue>>> = Mutex::new(None);
+
+/// Before a Signal of the title's on `queue`: the queue waits (on the GPU) for the copy-backs
+/// of what it ran so far, so a title that sees its fence done reads the GPU's writes in the
+/// CPU view, as on the console – without holding the submitting thread or any other queue.
+pub unsafe fn before_title_signal(queue: *mut c_void) {
+    let mut f = RB_QUEUES.lock().unwrap();
+    let Some(e) = f.as_mut().and_then(|m| m.get_mut(&(queue as usize))) else { return };
+    if e.waited >= e.value {
+        return;
+    }
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
+    // (the PC Wait: XCL's own call is not a console method)
+    if q.Wait(&e.done, e.value).is_ok() {
+        e.waited = e.value;
+    }
+}
+static READBACKS: Mutex<Vec<Readback>> = Mutex::new(Vec::new());
+static READBACK_READY: std::sync::Condvar = std::sync::Condvar::new();
+
+/// The readbacks of `pending` that are due: the title queue's work is done (`done`), or it
+/// waited `timeout` (copied anyway, as the fence wait used to give up). Each queue's own
+/// readbacks keep their order (its fence only grows); other queues' do not wait for them.
+fn due_readbacks<T>(pending: &mut Vec<T>, done: impl Fn(&T) -> bool, since: impl Fn(&T) -> std::time::Instant, timeout: std::time::Duration) -> Vec<T> {
+    let mut due = Vec::new();
+    let mut k = 0;
+    while k < pending.len() {
+        if done(&pending[k]) || since(&pending[k]).elapsed() >= timeout {
+            due.push(pending.remove(k));
+        } else {
+            k += 1;
+        }
+    }
+    due
+}
+
+/// GPU writes into sparse windows (counters other queues wait for, among others) were copied
+/// back to the CPU view in the submitting thread: it waited for the title queue's work (up to
+/// 5 s) holding the sparse state, and the copy queue was told to wait for that queue, so every
+/// upload of every other queue waited behind it. A retail game's queues wait for each other's
+/// counters: the submitting thread stood in that wait while the queue it waited for could not
+/// get the counter it waited for (released by the 2 s memory-wait timeout, frame after frame).
+/// The copy-back is now made here once the title queue is done, without blocking anyone.
+fn start_readback_worker() {
+    static START: std::sync::Once = std::sync::Once::new();
+    START.call_once(|| {
+        crate::xlog_info!("D3D12.X: GPU writes into sparse windows are copied back to the CPU once their queue is done, off the submitting thread");
+        let _ = std::thread::Builder::new().name("xcl-sparse-readback".into()).spawn(|| loop {
+            let due = {
+                let mut p = READBACKS.lock().unwrap();
+                while p.is_empty() {
+                    p = READBACK_READY.wait(p).unwrap();
+                }
+                // SAFETY: reading a fence's completed value
+                due_readbacks(&mut p, |r| unsafe { r.fence.GetCompletedValue() } >= r.value, |r| r.since, std::time::Duration::from_secs(5))
+            };
+            if due.is_empty() {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+                continue;
+            }
+            let mut g = STATE.lock().unwrap();
+            if let Some(s) = g.as_mut() {
+                for r in &due {
+                    // SAFETY: the state's own copy queue and buffers
+                    unsafe { s.readback_ranges(&r.ranges) };
+                }
+            }
+            drop(g);
+            for r in &due {
+                // SAFETY: a fence of XCL's, signalled from the CPU (never lowered)
+                unsafe {
+                    if r.done.GetCompletedValue() < r.value {
+                        let _ = r.done.Signal(r.value);
+                    }
+                }
+            }
+        });
+    });
 }
 
 /// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
@@ -1593,6 +1732,22 @@ pub fn forget_buffer(res: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A copy-back is due when its own queue is done (or it waited too long), whatever the other
+    /// queues' copy-backs wait for: one queue held up by another must not hold up the copy-back
+    /// of the counter that would release it.
+    #[test]
+    fn a_readback_is_due_when_its_own_queue_is_done_not_when_the_others_are() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        // (queue, value, made): queue A's first one is not done, queue B's is
+        let mut pending = vec![('A', 1u64, now), ('B', 1, now), ('A', 2, now - Duration::from_secs(6))];
+        let done = |r: &(char, u64, Instant)| r.0 == 'B';
+        let due = due_readbacks(&mut pending, done, |r| r.2, Duration::from_secs(5));
+        assert_eq!(due.iter().map(|r| (r.0, r.1)).collect::<Vec<_>>(), vec![('B', 1), ('A', 2)], "B's is done, A's second waited past the timeout");
+        assert_eq!(pending.iter().map(|r| (r.0, r.1)).collect::<Vec<_>>(), vec![('A', 1)]);
+        assert!(due_readbacks(&mut pending, |_| false, |r| r.2, Duration::from_secs(5)).is_empty(), "nothing else is due");
+    }
 
     /// A block freed on one thread while another allocates: its address goes back to the
     /// windows only once it is decommitted (released first, the decommit came after another
