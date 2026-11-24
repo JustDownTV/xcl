@@ -790,6 +790,9 @@ impl Pipelines {
         // the file a title's run reads the driver's blob from (`driver_cache`): there already,
         // nothing to build; made here, the blob goes there too – the driver's own shader cache
         // is not certain to hold it (a retail run still built 32 of them at their first use)
+        if FIRST.lock().unwrap().as_ref().is_some_and(|f| !f.contains(&crate::hle::d3d12x::real::driver_cache::name(&c.dxil, 0))) {
+            return;
+        }
         let disk = crate::hle::d3d12x::real::driver_cache::path(&c.dxil, 0);
         if disk.as_deref().is_some_and(|p| p.exists()) {
             self.made.fetch_add(1, Ordering::Relaxed);
@@ -833,7 +836,26 @@ impl Pipelines {
     }
 }
 
+/// `XCL_PRECOMPILE_FIRST=<dir>` with `--pipelines`: the pipelines whose driver blob is named in
+/// that folder (an earlier run's, e.g. another driver's) are made first, then the rest.
+static FIRST: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
 fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, t0: std::time::Instant) -> i32 {
+    if let (true, Ok(dir)) = (pipelines, std::env::var("XCL_PRECOMPILE_FIRST")) {
+        let names: std::collections::HashSet<String> =
+            std::fs::read_dir(&dir).map(|d| d.flatten().filter_map(|e| e.file_name().into_string().ok()).collect()).unwrap_or_default();
+        println!("first the {} pipelines named in {dir}", names.len());
+        *FIRST.lock().unwrap() = Some(names);
+        let r = precompile_pass(input, limit, windows, split, only, true, t0);
+        *FIRST.lock().unwrap() = None;
+        if r != 0 {
+            return r;
+        }
+    }
+    precompile_pass(input, limit, windows, split, only, pipelines, t0)
+}
+
+fn precompile_pass(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, t0: std::time::Instant) -> i32 {
     let pipelines = if pipelines {
         match Pipelines::new() {
             Ok(p) => Some(p),
