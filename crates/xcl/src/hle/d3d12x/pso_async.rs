@@ -636,10 +636,13 @@ fn resolve_compute_within(pso: usize, limit: Option<std::time::Duration>, budget
     }
 }
 
-/// Resolve a compute pipeline within `XCL_COMPUTE_PSO_WAIT_MS` and the frame's shared budget
-/// (`frame_wait_budget`).
+/// Resolve a compute pipeline within `XCL_COMPUTE_PSO_WAIT_MS` (4 s a frame), the time graphics
+/// waits spent this frame included – not within the graphics waits' `frame_wait_budget`: a
+/// skipped dispatch leaves its results unwritten, and a retail game read them. Held to 250 ms
+/// a frame like draws, 3 418 dispatches were skipped in 2 s as its first cinematic began and
+/// the title read an address out of their output (0xc0000005 at +0xee5e2f, two threads).
 pub fn resolve_compute(pso: usize) -> usize {
-    resolve_compute_within(pso, frame_limit(compute_wait_timeout()), &FRAME_BUDGET)
+    resolve_compute_within(pso, compute_wait_timeout(), &FRAME_BUDGET)
 }
 
 /// For binding: compute pipelines wait up to `XCL_COMPUTE_PSO_WAIT_MS` on background workers;
@@ -758,6 +761,25 @@ mod draw_wait_tests {
         assert_eq!(built(standin, &budget), real);
         assert_eq!(resolve_draw_with(standin, limit, &budget), real);
         assert_eq!(released(standin), real);
+    }
+
+    /// A compute build of a few hundred ms is waited for, not cut at the draws' 250 ms frame
+    /// budget: a skipped dispatch leaves output the title reads.
+    #[test]
+    fn a_compute_build_is_waited_for_beyond_the_draws_budget() {
+        let (c, c_real) = (0x7410_0051usize, 0x7410_0052usize);
+        submit_lazy(
+            c,
+            true,
+            Box::new(move || {
+                std::thread::sleep(Duration::from_millis(400));
+                c_real
+            }),
+            0,
+        );
+        FRAME_BUDGET.reset();
+        assert_eq!(resolve_compute(c), c_real, "waited for, not skipped");
+        assert_eq!(released(c), c_real);
     }
 
     /// Graphics and compute waits share the frame's budget: once a compute wait used it up, a
